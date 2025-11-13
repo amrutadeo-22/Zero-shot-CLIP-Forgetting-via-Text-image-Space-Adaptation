@@ -1,3 +1,4 @@
+import datasets.cifar10
 import os
 # import torch.optim as optim 
 import numpy as np
@@ -27,6 +28,7 @@ from clip import clip
 
 from utils import *
 import utils
+from utils import eval_zeroshot_metrics, compute_embedding_drift
 
 from utils_lora import *
 from collections import OrderedDict
@@ -39,16 +41,18 @@ torch.set_num_threads(10)
 device = 'cuda'
 IGNORE_OTHER_DS = False
 PRINT_EVERY = 200
-EPOCHS = 2000
+EPOCHS = 2 
 REDUCTION_THR = 0.7
-UNLEARN_TRIALS = 100
+UNLEARN_TRIALS = 1 
 
 CUSTOM_TEMPLATES = {
-        "OxfordFlowers": "a photo of a {}, a type of flower.",
-        "StanfordCars": "a photo of a {}.",
-        "Caltech101": "a photo of a {}.",
-        "StanfordDogs": "a photo of a {}.",
-        }
+    "OxfordFlowers": ["a photo of a {}, a type of flower."],
+    "StanfordCars": ["a photo of a {}."],
+    "Caltech101": ["a photo of a {}."],
+    "StanfordDogs": ["a photo of a {}."],
+    "CIFAR10Custom": ["a photo of a {}."]
+}
+
         
 def set_seeds(seed):
     torch.manual_seed(seed)
@@ -173,7 +177,12 @@ if __name__ == '__main__':
     cfg = initialize_config(args)
     test_datasets, test_dataloaders, datasets_cls = load_test_datasets(cfg)
     os.makedirs(args.output_dir, exist_ok=True)   
+    # configs = get_configs(args)
+    # Ensure run_ds is a string (not a list)
+    if isinstance(args.run_ds, list):
+        args.run_ds = args.run_ds[0]
     configs = get_configs(args)
+
         
     results_zs = load_results(args.backbone_arch)
     utils.CUSTOM_TEMPLATES = CUSTOM_TEMPLATES
@@ -218,12 +227,21 @@ if __name__ == '__main__':
     
     for main_ds in run_ds:
         
+        # kwargs = {
+        #       'lamb_preserve': configs[main_ds]['lamb_preserve'],
+        #       'lamb_forget': configs[main_ds]['lamb_forget'],
+        #       'lora_r': configs[main_ds]['lora_r'],
+        #       'lamb_weight': configs[main_ds]['lamb_weight'],
+        #       'CIFAR10Custom': {'lamb_forget': 0.5, 'lamb_preserve': 0.1}
+        #   }
+        configs = get_configs(args)
         kwargs = {
-              'lamb_preserve': configs[main_ds]['lamb_preserve'],
-              'lamb_forget': configs[main_ds]['lamb_forget'],
-              'lora_r': configs[main_ds]['lora_r'],
-              'lamb_weight': configs[main_ds]['lamb_weight'],
-          }
+            'lamb_preserve': configs['lamb_preserve'],
+            'lamb_forget': configs['lamb_forget'],
+            'lora_r': configs['lora_r'],
+            'lamb_weight': configs['lamb_weight'],
+        }
+
        
         args.output_dir = output_base + f"/{main_ds}"
         os.makedirs(args.output_dir, exist_ok=True)
@@ -264,7 +282,8 @@ if __name__ == '__main__':
                 'OxfordFlowers': oxfordflowers_list,
                 'StanfordDogs': stanforddogs_list,
                 'StanfordCars': stanfordcars_list,
-                'Caltech101': caltech_list
+                'Caltech101': caltech_list,
+                'CIFAR10Custom': cifar10_list
             })
             
             projection_additional, preserve_hooks = precompute_projections(model, classes_preserved_list)
@@ -276,6 +295,9 @@ if __name__ == '__main__':
             
             print(100*"=")
             model = get_model(device=device, arch=args.backbone_arch)
+            teacher = get_model(device=device, arch=args.backbone_arch)
+            teacher.eval()
+
             in_proj, out_proj = model.text_projection.shape
             
             proj_into = compute_proj_into(model, idx_cls_forget, idx_cls_forget_original, original_projections_norm, device)
@@ -284,7 +306,7 @@ if __name__ == '__main__':
             for _ in range(UNLEARN_TRIALS):
                                 
                 new_text_proj = Linear(in_proj, out_proj, r=r, bias=False, device=device)
-                new_text_proj.weight = torch.nn.Parameter(model.text_projection.T)
+                new_text_proj.weight =  torch.nn.Parameter(model.text_projection.T)
                 new_text_proj.weight.requires_grad = False
                 
                 optimizer = torch.optim.Adam(list(new_text_proj.parameters()), lr=0.01)
@@ -297,7 +319,8 @@ if __name__ == '__main__':
                     new_preserve_output = new_text_proj(preserve_hooks)
                     new_forget_output = new_text_proj(change_hooks)
                                         
-                    weight_loss = torch.norm((new_text_proj.lora_B @ new_text_proj.lora_A).transpose(0, 1), p=2) 
+                    # weight_loss = torch.norm((new_text_proj.lora_B @ new_text_proj.lora_A).transpose(0, 1), p=2) 
+                    weight_loss = torch.norm((new_text_proj.lora_B @ new_text_proj.lora_A).T, p=2)
                                             
                     loss = lamb_forget * torch.norm(proj_into - new_forget_output, p=2) + \
                            lamb_preserve * torch.norm(preserve_output - new_preserve_output, p=2) + \
@@ -344,10 +367,152 @@ if __name__ == '__main__':
 
             all_logs[main_ds][forget_label]['final_results'] = results_ds
             print(f"{20 * '*'} Final results for {forget_label}", results_ds[main_ds][forget_label])
-            
-            with open(output_base + "/logs.json", "w") as f:
-                json.dump(all_logs, f)
-            
+            print("\n========== Computing Forgetting Metrics ==========")
+            # P_txt = clip_classifier(datasets_cls[main_ds].classnames, [CUSTOM_TEMPLATES[main_ds]], model).to(device)
+            # P_txt = clip_classifier(datasets_cls[main_ds].classnames, CUSTOM_TEMPLATES[main_ds], model).to(device)
+            # forget_id = datasets_cls[main_ds].classnames.index(forget_label)
+            # # Compute Zero-Shot Metrics Before & After
+            # print("\n[Eval BEFORE] Teacher (zero-shot)")
+            # metrics_before = eval_zeroshot_metrics(teacher, test_dataloaders[main_ds], P_txt, device, [forget_id])
+            # print(f"BEFORE | overall={metrics_before['overall']:.4f}  retain={metrics_before['retain_acc']:.4f}  forget={metrics_before['forget_acc']:.4f}  R@1={metrics_before['r1']:.4f} R@5={metrics_before['r5']:.4f}")
+
+            # print("\n[Eval AFTER] Student (zero-shot)")
+            # metrics_after = eval_zeroshot_metrics(model, test_dataloaders[main_ds], P_txt, device, [forget_id])
+            # print(f"AFTER  | overall={metrics_after['overall']:.4f}  retain={metrics_after['retain_acc']:.4f}  forget={metrics_after['forget_acc']:.4f}  R@1={metrics_after['r1']:.4f} R@5={metrics_after['r5']:.4f}")
+            P_txt_teacher = clip_classifier(datasets_cls[main_ds].classnames, CUSTOM_TEMPLATES[main_ds], teacher).to(device)
+            P_txt_student = clip_classifier(datasets_cls[main_ds].classnames, CUSTOM_TEMPLATES[main_ds], model).to(device)
+            forget_id = datasets_cls[main_ds].classnames.index(forget_label)
+            print("\n[Eval BEFORE] Teacher (zero-shot)")
+            metrics_before = eval_zeroshot_metrics(teacher, test_dataloaders[main_ds], P_txt_teacher, device, [forget_id])
+            print(f"BEFORE | overall={metrics_before['overall']:.4f}  retain={metrics_before['retain_acc']:.4f}  forget={metrics_before['forget_acc']:.4f}  R@1={metrics_before['r1']:.4f} R@5={metrics_before['r5']:.4f}")
+
+            print("\n[Eval AFTER] Student (zero-shot)")
+            metrics_after = eval_zeroshot_metrics(model, test_dataloaders[main_ds], P_txt_student, device, [forget_id])
+            print(f"AFTER  | overall={metrics_after['overall']:.4f}  retain={metrics_after['retain_acc']:.4f}  forget={metrics_after['forget_acc']:.4f}  R@1={metrics_after['r1']:.4f} R@5={metrics_after['r5']:.4f}")
+            all_logs[main_ds][forget_label]['metrics_before'] = metrics_before
+            all_logs[main_ds][forget_label]['metrics_after'] = metrics_after
+            # Compute Embedding Drift
+            from torch.utils.data import Subset, DataLoader
+            test_data = test_dataloaders[main_ds].dataset
+            idx_retain = [i for i, d in enumerate(test_data) if d['label'] != datasets_cls[main_ds].classnames.index(forget_label)]
+            idx_forget = [i for i, d in enumerate(test_data) if d['label'] == datasets_cls[main_ds].classnames.index(forget_label)]
+
+            # idx_retain = [i for i, (_, y) in enumerate(test_data) if y != datasets_cls[main_ds].classnames.index(forget_label)]
+            # idx_forget = [i for i, (_, y) in enumerate(test_data) if y == datasets_cls[main_ds].classnames.index(forget_label)]
+
+            retain_loader = DataLoader(Subset(test_data, idx_retain), batch_size=64, shuffle=False, num_workers=2)
+            forget_loader = DataLoader(Subset(test_data, idx_forget), batch_size=64, shuffle=False, num_workers=2)
+            print("Teacher:", id(teacher))
+            print("Student:", id(model))
+            print("Same object:", teacher is model)
+# ///////////////////
+            # drift_retain = compute_embedding_drift(teacher, model, retain_loader, device)
+            # drift_forget = compute_embedding_drift(teacher, model, forget_loader, device)
+            # drift_retain = compute_embedding_drift(teacher, model, retain_loader, device, P_txt_student)
+            # drift_forget = compute_embedding_drift(teacher, model, forget_loader, device, P_txt_student)
+            # Compute and log drift (using projected embeddings if LoRA affects text)
+            # drift = compute_embedding_drift(teacher, model, retain_loader, device, P_txt_teacher, P_txt_student)
+            # all_logs[main_ds][forget_label]['drift'] = drift
+
+            # # Save logs
+            # with open(output_base + "/logs.json", "w") as f:
+            #     json.dump(all_logs, f, indent=2)
+
+            # # Quick diagnostic check: raw image-space drift
+            # images, _ = next(iter(retain_loader))
+            # images = images.to(device)
+            # z_t = teacher.encode_image(images)
+            # z_s = model.encode_image(images)
+            # img_drift = (z_t - z_s).pow(2).sum(dim=-1).sqrt().mean().item()
+            # print(f"\n[Diagnostic] Raw image encoder drift: {img_drift:.6f}")
+
+            # print("\n[Computing Embedding Drift]")
+
+            # # Proper drift computation (with text projections)
+            # with torch.no_grad():
+            #     drift_retain = compute_embedding_drift(teacher, model, retain_loader, device, P_txt_teacher, P_txt_student)
+            #     drift_forget = compute_embedding_drift(teacher, model, forget_loader, device, P_txt_teacher, P_txt_student)
+
+            # print(f"\nEmbedding Drift | retain={drift_retain:.4f}  forget={drift_forget:.4f}")
+
+            # # with open(output_base + "/logs.json", "w") as f:
+            #     json.dump(all_logs, f)
+            # Compute drift and save logs
+        drift = compute_embedding_drift(teacher, model, retain_loader, device, P_txt_teacher, P_txt_student)
+        all_logs[main_ds][forget_label]['drift'] = drift
+
+        with open(output_base + "/logs.json", "w") as f:
+            json.dump(all_logs, f, indent=2)
+
+        # ---- Handle flexible dataloader outputs ----
+        # print("\n[Computing Embedding Drift Sanity Check]")
+
+        # batch = next(iter(retain_loader))
+        # if isinstance(batch, (list, tuple)):
+        #     images = batch[0]  # first element is image tensor
+        # elif isinstance(batch, dict):
+        #     # some datasets might return dicts
+        #     images = batch.get("image") or batch.get("images")
+        # else:
+        #     raise ValueError(f"Unexpected batch type: {type(batch)}")
+
+        # images = images.to(device)
+        # z_t = teacher.encode_image(images)
+        # z_s = model.encode_image(images)
+
+        # mean_l2_drift = (z_t - z_s).pow(2).sum(dim=-1).sqrt().mean().item()
+        # print(f"Mean L2 drift (retain sample batch): {mean_l2_drift:.6f}")
+        print("\n[Computing Embedding Drift Sanity Check]")
+
+        batch = next(iter(retain_loader))
+
+        # --- handle multiple dataset formats ---
+        images = None
+        if isinstance(batch, (list, tuple)):
+            # Try to find the first tensor with 4 dims (B, C, H, W)
+            for v in batch:
+                if torch.is_tensor(v) and v.ndim == 4:
+                    images = v
+                    break
+        elif isinstance(batch, dict):
+            # handle dict-return datasets
+            for k, v in batch.items():
+                if torch.is_tensor(v) and v.ndim == 4:
+                    images = v
+                    break
+        else:
+            raise ValueError(f"Unexpected batch type: {type(batch)}")
+
+        if images is None:
+            raise ValueError(f"No valid 4D image tensor found in batch keys/types: {type(batch)}")
+
+        # move to device
+        images = images.to(device, non_blocking=True)
+
+        # compute embeddings
+        z_t = teacher.encode_image(images)
+        z_s = model.encode_image(images)
+        mean_l2_drift = (z_t - z_s).pow(2).sum(dim=-1).sqrt().mean().item()
+        print(f"Mean L2 drift (retain sample batch): {mean_l2_drift:.6f}")
+
+        # ---- Compute full drift values ----
+        with torch.no_grad():
+            drift_retain = compute_embedding_drift(teacher, model, retain_loader, device, P_txt_student)
+            drift_forget = compute_embedding_drift(teacher, model, forget_loader, device, P_txt_student)
+        print("Drift retain:", drift_retain)
+        print("Drift forget:", drift_forget)
+
+        if isinstance(drift_retain, dict):
+            print("\nEmbedding Drift Summary:")
+            print(f" Retain | image={drift_retain['image_drift']:.4f}, "
+                  f"text_teacherproj={drift_retain['textsim_drift_teacherproj']:.4f}, "
+                  f"text_studentproj={drift_retain['textsim_drift_studentproj']:.4f}")
+            print(f" Forget | image={drift_forget['image_drift']:.4f}, "
+                  f"text_teacherproj={drift_forget['textsim_drift_teacherproj']:.4f}, "
+                  f"text_studentproj={drift_forget['textsim_drift_studentproj']:.4f}")
+        else:
+            print(f"\nEmbedding Drift | retain={drift_retain:.4f}  forget={drift_forget:.4f}")
+
         print(all_logs)
 
 
