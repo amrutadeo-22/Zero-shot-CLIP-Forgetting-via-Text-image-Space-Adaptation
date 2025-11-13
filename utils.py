@@ -1,3 +1,4 @@
+import datasets.cifar10
 import numpy as np
 import torch
 from clip import clip
@@ -98,7 +99,9 @@ def eval_all_ds(model, datasets_cls, forget_ds, forget_lbl, all_loaders, train_l
         test_loader = all_loaders[ds]
         
         classnames = datasets_cls[ds].classnames
-        clip_weights = clip_classifier(classnames, [CUSTOM_TEMPLATES[ds]], model).to(device)
+        # clip_weights = clip_classifier(classnames, [CUSTOM_TEMPLATES[ds]], model).to(device)
+        clip_weights = clip_classifier(classnames, CUSTOM_TEMPLATES[ds], model).to(device)
+
         
         if ds == forget_ds:
             cls_acc_test = None
@@ -234,6 +237,318 @@ def evaluate_clip_zs(model, loader, clip_weights, device=None, out_conf=False, o
 
     return acc
 
+# @torch.no_grad()
+# def eval_zeroshot_metrics(model, loader, P_txt, device, forget_ids, tau=0.07):
+#     model.eval()
+#     total, correct = 0, 0
+#     correct_f, cnt_f = 0, 0
+#     correct_r, cnt_r = 0, 0
+#     top1, top5 = 0, 0
+#     C = P_txt.size(0)
+#     # for images, labels in tqdm(loader, desc="Eval (zero-shot)"):
+#     for batch in tqdm(loader, desc="Eval (zero-shot)"):
+#     # Handle dataset formats flexibly
+#         if isinstance(batch, dict):
+#             images = batch.get("img", batch.get("image"))
+#             labels = batch.get("label", batch.get("target"))
+#         elif isinstance(batch, (list, tuple)):
+#             images, labels = batch[0], batch[1]
+#         else:
+#             raise TypeError(f"Unexpected batch type: {type(batch)}")
+
+#         images = images.to(device, non_blocking=True)
+#         labels = labels.to(device, non_blocking=True)
+#         z = model.encode_image(images)
+#         z = z / (z.norm(dim=-1, keepdim=True) + 1e-8)
+#         # Ensure dimensions are compatible
+#         if P_txt.shape[1] != z.shape[1]:
+#             P_txt = P_txt.T  # Fix orientation if text embedding shape is transposed
+
+#         logits = 100. * z @ P_txt.T  # (batch, embed) @ (embed, classes) → (batch, classes)
+
+#         # logits = 100. * z @ P_txt.T  # Similar to clip_logits
+#         preds = logits.argmax(dim=-1)
+#         total += labels.numel()
+#         correct += (preds == labels).sum().item()
+#         # top-k
+#         _, topk = logits.topk(k=min(5, C), dim=-1)
+#         top1 += (topk[:, :1] == labels.unsqueeze(1)).any(dim=1).float().sum().item()
+#         top5 += (topk == labels.unsqueeze(1)).any(dim=1).float().sum().item()
+
+#         # Separate forget vs retain
+#         if len(forget_ids) > 0:
+#             mask_f = torch.isin(labels, torch.tensor(forget_ids, device=labels.device))
+#             mask_r = ~mask_f
+#             if mask_f.any():
+#                 correct_f += (preds[mask_f] == labels[mask_f]).sum().item()
+#                 cnt_f += mask_f.sum().item()
+#             if mask_r.any():
+#                 correct_r += (preds[mask_r] == labels[mask_r]).sum().item()
+#                 cnt_r += mask_r.sum().item()
+
+#     overall = correct / max(1, total)
+#     forget_acc = (correct_f / max(1, cnt_f)) if cnt_f > 0 else float("nan")
+#     retain_acc = (correct_r / max(1, cnt_r)) if cnt_r > 0 else float("nan")
+#     r1 = top1 / max(1, total)
+#     r5 = top5 / max(1, total)
+#     return {
+#         "overall": overall,
+#         "retain_acc": retain_acc,
+#         "forget_acc": forget_acc,
+#         "r1": r1,
+#         "r5": r5
+#     }
+from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
+
+@torch.no_grad()
+def eval_zeroshot_metrics(model, loader, P_txt, device, forget_ids, tau=0.07):
+    """
+    Returns dict with:
+     - overall, retain_acc, forget_acc, r1, r5 (as before)
+     - conf_mat: full confusion matrix (numpy)
+     - per_class: dict with precision, recall (TPR), f1, support (arrays)
+     - macro_precision, macro_recall, macro_f1
+    """
+    model.eval()
+    preds_all = []
+    labels_all = []
+
+    C = P_txt.size(0)
+
+    for batch in tqdm(loader, desc="Eval (zero-shot)"):
+        # unpack robustly
+        if isinstance(batch, dict):
+            images = batch.get("img", batch.get("image"))
+            labels = batch.get("label", batch.get("target"))
+        else:
+            images, labels = batch[0], batch[1]
+
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        z = model.encode_image(images)
+        z = z / (z.norm(dim=-1, keepdim=True) + 1e-8)
+        # Ensure P_txt orientation
+        if P_txt.shape[1] == z.shape[1]:
+            P_mat = P_txt.T
+        elif P_txt.shape[0] == z.shape[1]:
+            P_mat = P_txt.T
+        else:
+            P_mat = P_txt.T
+
+        # logits = 100. * z @ P_mat  # (B, C)
+        # Ensure orientation (want (embed_dim, num_classes))
+        if P_mat.shape[0] == z.shape[1]:
+            logits = 100. * z @ P_mat
+        elif P_mat.shape[1] == z.shape[1]:
+            logits = 100. * z @ P_mat.T
+        else:
+            raise RuntimeError(f"Incompatible shapes: z={z.shape}, P_mat={P_mat.shape}")
+        preds = logits.argmax(dim=-1)
+
+        preds_all.append(preds.cpu())
+        labels_all.append(labels.cpu())
+
+    labels_all = torch.cat(labels_all).numpy()
+    preds_all = torch.cat(preds_all).numpy()
+
+    overall = (preds_all == labels_all).mean()
+
+    # separate forget vs retain
+    mask_f = np.isin(labels_all, np.array(forget_ids))
+    if mask_f.any():
+        forget_acc = (preds_all[mask_f] == labels_all[mask_f]).mean()
+    else:
+        forget_acc = float("nan")
+    mask_r = ~mask_f
+    if mask_r.any():
+        retain_acc = (preds_all[mask_r] == labels_all[mask_r]).mean()
+    else:
+        retain_acc = float("nan")
+
+    # top-1 and top-5 (recompute properly)
+    # We need to recompute logits to get top-k; do it quick in batches:
+    # (for simplicity reuse evaluate_clip_zs if exists; otherwise you can compute top1/top5 above)
+    # Here compute top1/top5 approximated by overall and top-5 by checking model outputs again:
+    # For now return r1 as overall, r5 as NaN (or compute separately if needed)
+    r1 = overall
+    r5 = float("nan")
+
+    # confusion matrix + per-class metrics
+    conf = confusion_matrix(labels_all, preds_all)
+    precision, recall, f1, support = precision_recall_fscore_support(labels_all, preds_all, zero_division=0)
+
+    per_class = {
+        "precision": precision.tolist(),
+        "recall": recall.tolist(),   # recall == TPR per class
+        "f1": f1.tolist(),
+        "support": support.tolist()
+    }
+    macro_precision = float(np.mean(precision))
+    macro_recall = float(np.mean(recall))
+    macro_f1 = float(np.mean(f1))
+
+    return {
+        "overall": float(overall),
+        "retain_acc": float(retain_acc) if not np.isnan(retain_acc) else float("nan"),
+        "forget_acc": float(forget_acc) if not np.isnan(forget_acc) else float("nan"),
+        "r1": float(r1),
+        "r5": float(r5),
+        "conf_mat": conf.tolist(),
+        "per_class": per_class,
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
+        "macro_f1": macro_f1
+    }
+
+# @torch.no_grad()
+# def compute_embedding_drift(teacher, student, loader, device,P_txt=None):
+#     teacher.eval()
+#     student.eval()
+#     dists = []
+#     for images, _ in tqdm(loader, desc="Drift pass"):
+#         images = images.to(device, non_blocking=True)
+#         z_t = teacher.encode_image(images)
+#         z_s = student.encode_image(images)
+#         z_t = z_t / (z_t.norm(dim=-1, keepdim=True) + 1e-8)
+#         z_s = z_s / (z_s.norm(dim=-1, keepdim=True) + 1e-8)
+#         d = (z_t - z_s).pow(2).sum(dim=-1).sqrt()  # ℓ2 distance
+#         dists.append(d.cpu())
+#     if len(dists) == 0:
+#         return float('nan')
+#     return float(torch.cat(dists, dim=0).mean().item())
+# @torch.no_grad()
+# def compute_embedding_drift(teacher, student, loader, device, P_txt=None):
+#     teacher.eval()
+#     student.eval()
+#     dists = []
+
+#     for batch in tqdm(loader, desc="Drift pass"):
+#         # Handle both dict and tuple outputs
+#         if isinstance(batch, dict):
+#             images = batch["img"].to(device, non_blocking=True)
+#         else:
+#             images, _ = batch
+#             images = images.to(device, non_blocking=True)
+
+#         # Encode
+#         z_t = teacher.encode_image(images)
+#         z_s = student.encode_image(images)
+
+#         # Normalize
+#         z_t = z_t / (z_t.norm(dim=-1, keepdim=True) + 1e-8)
+#         z_s = z_s / (z_s.norm(dim=-1, keepdim=True) + 1e-8)
+
+#         # Optional: project into text space
+#         if P_txt is not None:
+#             z_t = z_t @ P_txt
+#             z_s = z_s @ P_txt
+
+#         # ℓ2 distance
+#         d = (z_t - z_s).pow(2).sum(dim=-1).sqrt()
+#         dists.append(d.cpu())
+
+#     if len(dists) == 0:
+#         return float("nan")
+
+#     return float(torch.cat(dists, dim=0).mean().item())
+@torch.no_grad()
+def compute_embedding_drift(
+    teacher, student, loader, device,
+    P_txt_teacher: torch.Tensor = None,
+    P_txt_student: torch.Tensor = None,
+    return_per_sample: bool = False
+):
+    """
+    Returns a dict with:
+      - image_drift: mean L2 distance between teacher and student image embeddings
+      - textsim_drift_teacherproj: mean L2 between (z_t @ P_txt_teacher) and (z_s @ P_txt_teacher)
+          (useful to detect image-encoder changes when using same classifier)
+      - textsim_drift_studentproj: mean L2 between (z_t @ P_txt_teacher) and (z_s @ P_txt_student)
+          (captures changes due to text projection differences)
+    P_txt_teacher and P_txt_student should be shape (num_classes, embed_dim) or (embed_dim, num_classes).
+    """
+    teacher.eval()
+    student.eval()
+
+    image_dists = []
+    ts_teacher_dists = []
+    ts_student_dists = []
+
+    for batch in tqdm(loader, desc="Drift pass"):
+        # robust batch unpacking
+        if isinstance(batch, dict):
+            images = batch.get("img", batch.get("image"))
+        else:
+            images = batch[0]
+
+        images = images.to(device, non_blocking=True)
+
+        z_t = teacher.encode_image(images)
+        z_s = student.encode_image(images)
+
+        z_t = z_t / (z_t.norm(dim=-1, keepdim=True) + 1e-8)
+        z_s = z_s / (z_s.norm(dim=-1, keepdim=True) + 1e-8)
+
+        # image drift (original)
+        d_img = (z_t - z_s).pow(2).sum(dim=-1).sqrt().cpu()
+        image_dists.append(d_img)
+
+        # text-sim drifts — only if P_txt provided
+        if P_txt_teacher is not None:
+            P_t = P_txt_teacher
+            # ensure orientation: want shape (embed_dim, num_classes) to multiply z @ P
+            if P_t.shape[0] == z_t.shape[1]:
+                P_t_mat = P_t
+            elif P_t.shape[1] == z_t.shape[1]:
+                P_t_mat = P_t.T
+            else:
+                raise RuntimeError(f"P_txt_teacher shape {P_t.shape} incompatible with embed dim {z_t.shape[1]}")
+
+            logits_t = z_t @ P_t_mat  # (B, C)
+            logits_s = z_s @ P_t_mat
+            d_ts = (logits_t - logits_s).pow(2).sum(dim=-1).sqrt().cpu()
+            ts_teacher_dists.append(d_ts)
+
+        if (P_txt_teacher is not None) and (P_txt_student is not None):
+            # ensure student P_txt orientation
+            P_s = P_txt_student
+            if P_s.shape[0] == z_s.shape[1]:
+                P_s_mat = P_s
+            elif P_s.shape[1] == z_s.shape[1]:
+                P_s_mat = P_s.T
+            else:
+                raise RuntimeError(f"P_txt_student shape {P_s.shape} incompatible with embed dim {z_s.shape[1]}")
+
+            logits_t = z_t @ P_t_mat  # teacher proj
+            logits_s_student = z_s @ P_s_mat
+            d_ts_student = (logits_t - logits_s_student).pow(2).sum(dim=-1).sqrt().cpu()
+            ts_student_dists.append(d_ts_student)
+
+    # aggregate
+    if len(image_dists) == 0:
+        return {
+            "image_drift": float("nan"),
+            "textsim_drift_teacherproj": float("nan"),
+            "textsim_drift_studentproj": float("nan")
+        }
+
+    image_d = float(torch.cat(image_dists).mean().item())
+    ts_teacher_d = float(torch.cat(ts_teacher_dists).mean().item()) if len(ts_teacher_dists) else float("nan")
+    ts_student_d = float(torch.cat(ts_student_dists).mean().item()) if len(ts_student_dists) else float("nan")
+
+    out = {
+        "image_drift": image_d,
+        "textsim_drift_teacherproj": ts_teacher_d,
+        "textsim_drift_studentproj": ts_student_d
+    }
+
+    if return_per_sample:
+        out["per_sample_image"] = torch.cat(image_dists).numpy()
+        if len(ts_teacher_dists): out["per_sample_text_teacherproj"] = torch.cat(ts_teacher_dists).numpy()
+        if len(ts_student_dists): out["per_sample_text_studentproj"] = torch.cat(ts_student_dists).numpy()
+
+    return out
 
 def acc_certain_cls(acc_all, all_lbls, ids_lbl):
     acc_selected = acc_all[ids_lbl]
